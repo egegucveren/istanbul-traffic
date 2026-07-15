@@ -9,6 +9,13 @@ import {
   Polyline,
 } from "@react-google-maps/api";
 
+// Stable reference — LoadScript remounts (and reloads the Google Maps
+// script) every time this array's identity changes, which was previously
+// happening on every render because a new array literal was passed inline.
+// That reload loop is what caused the spurious "InvalidKey" errors even
+// though the key itself was valid and correctly configured.
+const GOOGLE_MAPS_LIBRARIES: ("places" | "geometry")[] = ["places", "geometry"];
+
 type LatLng = google.maps.LatLngLiteral;
 
 type CommuteRoute = {
@@ -20,11 +27,18 @@ type CommuteRoute = {
   warnings?: string | null;
   diffToFastestMin?: number | null;
   deltaPctVsTypical?: number | null;
+  // Hava durumu + yakındaki etkinliklere göre ayarlanmış tahmini süre.
+  expectedMin?: number | null;
+  adjustmentReasons?: string[];
 };
 
 type CommuteResp = {
   routes: CommuteRoute[];
   fastestMode: string | null;
+  weatherConsidered?: boolean;
+  eventsConsidered?: number;
+  travelAt?: string;
+  isFutureTrip?: boolean;
   generatedAt: string;
 };
 
@@ -118,6 +132,10 @@ export default function TrafficMap() {
   const [selected, setSelected] = useState<CommuteRoute | null>(null);
   const [commuteLoading, setCommuteLoading] = useState(false);
   const [commuteError, setCommuteError] = useState<string | null>(null);
+  // Boş = "şu an". datetime-local input değeri (yerel saat, saniyesiz): "2026-08-20T14:00"
+  const [whenText, setWhenText] = useState("");
+  const [travelAt, setTravelAt] = useState<string | null>(null);
+  const [isFutureTrip, setIsFutureTrip] = useState(false);
 
   const [events, setEvents] = useState<EventItem[]>([]);
   const [eventsLoading, setEventsLoading] = useState(true);
@@ -250,11 +268,21 @@ export default function TrafficMap() {
       to: `${destination.lat},${destination.lng}`,
       modes: "driving,transit,walking",
     });
+    // whenText boşsa "şu an" — datetime-local input yerel saat döndürür,
+    // backend bunu ISO olarak parse edip Google/hava durumu/etkinlikler için kullanır.
+    if (whenText) {
+      const localDate = new Date(whenText);
+      if (!Number.isNaN(localDate.getTime())) {
+        qs.set("when", localDate.toISOString());
+      }
+    }
     try {
       const r = await fetch(`${API_BASE}/api/commute?${qs.toString()}`);
       if (!r.ok) throw new Error(await r.text());
       const j: CommuteResp = await r.json();
       setRoutes(j.routes);
+      setTravelAt(j.travelAt || null);
+      setIsFutureTrip(!!j.isFutureTrip);
       const fastest =
         j.routes.filter((x) => x.nowMin != null).sort((a, b) => (a.nowMin! - b.nowMin!))[0] || null;
       setSelected(fastest || null);
@@ -270,6 +298,7 @@ export default function TrafficMap() {
       console.error(e);
       setRoutes([]);
       setSelected(null);
+      setTravelAt(null);
       setCommuteError("Rota hesaplanamadı, lütfen tekrar deneyin");
     } finally {
       setCommuteLoading(false);
@@ -300,11 +329,23 @@ export default function TrafficMap() {
     return weather.next3h.probability.some((p) => p != null && p >= 50);
   }, [weather]);
 
+  // datetime-local input için yerel saat "YYYY-MM-DDTHH:mm" biçimi.
+  const toLocalInputValue = (d: Date) => {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const minWhen = useMemo(() => toLocalInputValue(new Date()), []);
+  const maxWhen = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    return toLocalInputValue(d);
+  }, []);
+
   // ---------- Render ----------
   return (
     <LoadScript
       googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_KEY as string}
-      libraries={["places", "geometry"] as any}
+      libraries={GOOGLE_MAPS_LIBRARIES}
     >
       <div style={{ display: "flex", width: "100vw", height: "100vh" }}>
         {/* Sol Panel (tasarım korunuyor) */}
@@ -364,6 +405,16 @@ export default function TrafficMap() {
               />
             </Autocomplete>
 
+            <div style={labelStyle}>Ne zaman? (opsiyonel — boşsa şu an)</div>
+            <input
+              type="datetime-local"
+              value={whenText}
+              onChange={(e) => setWhenText(e.target.value)}
+              min={minWhen}
+              max={maxWhen}
+              style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
+            />
+
             <button
               style={{ marginTop: 10, width: "100%", padding: 10, fontWeight: 600 }}
               onClick={calcRoute}
@@ -376,7 +427,12 @@ export default function TrafficMap() {
             {/* Rota özetleri */}
             {routes.length > 0 && (
               <div style={{ marginTop: 12 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>Seçenekler</div>
+                <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                  {isFutureTrip && travelAt
+                    ? `${new Date(travelAt).toLocaleString("tr-TR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })} için tahmini`
+                    : "Şu an için"}
+                </div>
+                <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13, color: "#666" }}>Seçenekler</div>
                 {routes.map((r, i) => (
                   <div
                     key={i}
@@ -394,7 +450,7 @@ export default function TrafficMap() {
                       {r.mode === "driving" ? "Araba" : r.mode === "transit" ? "Toplu Taşıma" : "Yürüyüş"}
                     </div>
                     <div style={{ fontSize: 13 }}>
-                      Şu an: {r.nowMin ?? "-"} dk &nbsp;|&nbsp; Tipik: {r.typicalMin ?? "-"} dk
+                      {isFutureTrip ? "Trafik tahmini" : "Şu an"}: {r.nowMin ?? "-"} dk &nbsp;|&nbsp; Tipik: {r.typicalMin ?? "-"} dk
                       {typeof r.diffToFastestMin === "number" && r.diffToFastestMin !== 0 && (
                         <> &nbsp;(+{r.diffToFastestMin} dk)</>
                       )}
@@ -402,6 +458,18 @@ export default function TrafficMap() {
                         <> &nbsp;({r.deltaPctVsTypical > 0 ? "+" : ""}{r.deltaPctVsTypical}%)</>
                       )}
                     </div>
+                    {typeof r.expectedMin === "number" && r.expectedMin !== r.nowMin && (
+                      <div style={{ fontSize: 13, fontWeight: 600, color: "#a15c00", marginTop: 2 }}>
+                        Hava/etkinlik dahil beklenen: {r.expectedMin} dk
+                      </div>
+                    )}
+                    {r.adjustmentReasons && r.adjustmentReasons.length > 0 && (
+                      <ul style={{ margin: "4px 0 0", paddingLeft: 16, fontSize: 11, color: "#a15c00" }}>
+                        {r.adjustmentReasons.map((reason, ri) => (
+                          <li key={ri}>{reason}</li>
+                        ))}
+                      </ul>
+                    )}
                     {r.warnings && <div style={{ color: "#b00", fontSize: 12 }}>{r.warnings}</div>}
                   </div>
                 ))}

@@ -1,0 +1,23 @@
+[
+  {
+    "_comment": "This is a TEMPLATE with placeholder dates/titles, not real listings. Copy this file to events.manual.json and replace the entries below with concerts/theater/stand-up/etc you actually know about. venueKey must match one of the keys in ISTANBUL_VENUES (backend/lib.js): vodafone-park, rams-park, sukru-saracoglu, ulker-sports-arena, sinan-erdem, zorlu-psm, kucukciftlik-park, crr, harbiye-acikhava, akm, tuyap.",
+    "title": "PLACEHOLDER — replace with a real event title",
+    "venueKey": "zorlu-psm",
+    "start": "2026-09-12T20:30:00+03:00",
+    "end": "2026-09-12T23:00:00+03:00"
+  },
+  {
+    "title": "PLACEHOLDER — replace with a real event title",
+    "venueKey": "harbiye-acikhava",
+    "start": "2026-08-05T21:00:00+03:00",
+    "end": "2026-08-05T23:00:00+03:00"
+  },
+  {
+    "title": "PLACEHOLDER — you can also skip venueKey and give lat/lng directly for a venue not in the list",
+    "venue": "Custom venue name",
+    "lat": 41.05,
+    "lng": 29.0,
+    "start": "2026-10-01T19:00:00+03:00",
+    "end": "2026-10-01T22:00:00+03:00"
+  }
+]
