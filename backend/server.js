@@ -2,13 +2,38 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch"); // v2
+const rateLimit = require("express-rate-limit");
+const ical = require("node-ical");
 require("dotenv").config();
+
+const { computeIndex, classifyVenue, isHolidayEvent, splitEvents } = require("./lib");
 
 const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 5050;
 const GMAPS_KEY = process.env.GOOGLE_MAPS_SERVER_KEY;
+
+/* ----------------------------
+   Rate limiting
+   Google Directions calls cost money per request, so every route that can
+   trigger one is capped per IP. /api/commute is the most abuse-prone (user
+   controlled origin/destination, no caching), so it gets a tighter limit.
+   ---------------------------- */
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const commuteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla istek gönderildi, lütfen bir dakika sonra tekrar deneyin." },
+});
+app.use(generalLimiter);
 
 /* ----------------------------
    Şehir Geneli Trafik İndeksi (Directions üzerinden türetilir)
@@ -71,13 +96,9 @@ app.get("/api/index", async (_req, res) => {
         }
       })
     );
-    const ok = results.filter(r => !r.error);
-    if (!ok.length) throw new Error("No routes computed");
-    const avgIncrease = ok.reduce((s, r) => s + r.increasePct, 0) / ok.length;
-    let index = Math.round(Math.min(99, Math.max(1, 1 + avgIncrease)));
-    if (!Number.isFinite(index)) index = 1;
+    const { index, avgIncreasePct } = computeIndex(results);
 
-    indexCache = { index, avgIncreasePct: Math.round(avgIncrease), routes: results, updatedAt: new Date().toISOString() };
+    indexCache = { index, avgIncreasePct, routes: results, updatedAt: new Date().toISOString() };
     indexCacheAt = Date.now();
     res.json(indexCache);
   } catch (err) {
@@ -89,7 +110,7 @@ app.get("/api/index", async (_req, res) => {
 /* ----------------------------
    Gidiş Asistanı
    ---------------------------- */
-app.get("/api/commute", async (req, res) => {
+app.get("/api/commute", commuteLimiter, async (req, res) => {
   try {
     const { from, to, modes = "driving,transit,walking" } = req.query;
     if (!from || !to) return res.status(400).json({ error: "from,to gerekli. Örn: 41.0,29.0" });
@@ -137,29 +158,94 @@ app.get("/api/commute", async (req, res) => {
 });
 
 /* ----------------------------
-   Etkinlik / Maç Pik Uyarısı (örnek)
+   Etkinlik / Maç Pik Uyarısı
+   Gerçek veri: EVENTS_ICS_URLS (.env) içindeki takım fikstürü + resmi tatil
+   .ics beslemelerinden çekilir. Sadece İstanbul'daki (ev sahibi) maçlar ve
+   resmi tatiller işlenir; deplasman maçları atlanır. Besleme çekilemezse
+   (ağ hatası vb.) küçük bir örnek listeye düşülür ki panel boş kalmasın.
    ---------------------------- */
-const EVENTS = [
-  { title: "Vodafone Park Maçı",   lat: 41.0391, lng: 29.0006, start: "2025-09-01T18:00:00+03:00", end: "2025-09-01T21:00:00+03:00", venue: "Vodafone Park" },
-  { title: "Rams Park Maçı",       lat: 41.1032, lng: 28.9989, start: "2025-09-02T20:00:00+03:00", end: "2025-09-02T23:00:00+03:00", venue: "Rams Park" },
-  { title: "TÜYAP Fuarı",          lat: 41.0065, lng: 28.6414, start: "2025-09-05T10:00:00+03:00", end: "2025-09-05T19:00:00+03:00", venue: "TÜYAP" },
-  { title: "Ülker Arena Konseri",  lat: 40.9857, lng: 29.1171, start: "2025-09-03T19:00:00+03:00", end: "2025-09-03T22:30:00+03:00", venue: "Ülker Sports Arena" },
+const ICS_URLS = (process.env.EVENTS_ICS_URLS || "")
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+const FALLBACK_EVENTS = [
+  { title: "Vodafone Park Maçı", lat: 41.0391, lng: 29.0006, start: "2025-09-01T18:00:00+03:00", end: "2025-09-01T21:00:00+03:00", venue: "Vodafone Park" },
+  { title: "Rams Park Maçı", lat: 41.1032, lng: 28.9989, start: "2025-09-02T20:00:00+03:00", end: "2025-09-02T23:00:00+03:00", venue: "Rams Park" },
 ];
 
-app.get("/api/events/upcoming", (_req, res) => {
+async function fetchIcsEvents(url) {
+  try {
+    const data = await ical.async.fromURL(url);
+    return Object.values(data).filter((ev) => ev.type === "VEVENT");
+  } catch (e) {
+    console.error("ICS fetch failed:", url, e.message);
+    return [];
+  }
+}
+
+async function loadEvents() {
+  if (!ICS_URLS.length) return FALLBACK_EVENTS;
+
   const now = new Date();
-  const active = [];
-  const upcoming = [];
-  for (const ev of EVENTS) {
+  const horizon = new Date(now.getTime() + 21 * 24 * 60 * 60 * 1000); // 3 hafta ileri bak
+
+  const raw = (await Promise.all(ICS_URLS.map(fetchIcsEvents))).flat();
+  const mapped = [];
+
+  for (const ev of raw) {
+    if (!ev.start || !ev.end) continue;
     const start = new Date(ev.start);
     const end = new Date(ev.end);
-    const pre = new Date(start.getTime() - 2 * 60 * 60 * 1000); // 2 saat önce
-    const post = new Date(end.getTime() + 60 * 60 * 1000);      // 1 saat sonra
-    const item = { ...ev, startISO: start.toISOString(), endISO: end.toISOString() };
-    if (now >= pre && now <= post) active.push(item);
-    else if (start > now) upcoming.push(item);
+    if (end < now || start > horizon) continue; // sadece yakın zaman aralığı
+
+    const venue = classifyVenue(ev.location || "");
+    if (venue) {
+      mapped.push({
+        title: ev.summary || "Maç",
+        lat: venue.lat,
+        lng: venue.lng,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        venue: venue.name,
+      });
+    } else if (isHolidayEvent(ev.summary || "")) {
+      mapped.push({
+        title: ev.summary,
+        lat: null,
+        lng: null,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        venue: "İstanbul geneli (resmi tatil)",
+      });
+    }
+    // Diğerleri (İstanbul dışındaki deplasman maçları vb.) atlanır.
   }
-  res.json({ active, upcoming, generatedAt: now.toISOString() });
+
+  return mapped.length ? mapped : FALLBACK_EVENTS;
+}
+
+let eventsCache = null;
+let eventsCacheAt = 0;
+const EVENTS_TTL = 15 * 60 * 1000;
+
+app.get("/api/events/upcoming", async (_req, res) => {
+  try {
+    if (!eventsCache || Date.now() - eventsCacheAt > EVENTS_TTL) {
+      eventsCache = await loadEvents();
+      eventsCacheAt = Date.now();
+    }
+    const { active, upcoming } = splitEvents(eventsCache, new Date());
+    res.json({
+      active,
+      upcoming,
+      generatedAt: new Date().toISOString(),
+      source: ICS_URLS.length ? "ics" : "fallback",
+    });
+  } catch (e) {
+    console.error("events error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ----------------------------
@@ -199,4 +285,8 @@ app.get("/api/weather", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Backend http://localhost:${PORT} üzerinde çalışıyor`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`✅ Backend http://localhost:${PORT} üzerinde çalışıyor`));
+}
+
+module.exports = app;

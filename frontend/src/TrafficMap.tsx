@@ -36,14 +36,32 @@ type IndexResp = {
 
 type EventItem = {
   title: string;
-  lat: number;
-  lng: number;
+  lat: number | null;
+  lng: number | null;
   startISO: string;
   endISO: string;
   venue: string;
 };
 
-const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5050";
+type WeatherResp = {
+  current: {
+    temperature: number | null;
+    precipitation: number;
+    weatherCode: number | null;
+    windSpeed: number | null;
+  };
+  next3h: {
+    time: string[];
+    precipitation: number[];
+    probability: number[];
+    rain: number[];
+  };
+  updatedAt: string;
+};
+
+// Not: eski kod REACT_APP_API_BASE okuyordu ama .env dosyası REACT_APP_BACKEND
+// tanımlıyordu, yani override hiçbir zaman uygulanmıyordu. Düzeltildi.
+const API_BASE = process.env.REACT_APP_BACKEND || "http://localhost:5050";
 
 // ---------- Tasarım stilleri (dokunmuyorum) ----------
 const containerStyle = { width: "100%", height: "100%" };
@@ -65,6 +83,15 @@ const labelStyle: React.CSSProperties = {
   color: "#666",
   marginTop: 8,
 };
+const mutedStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: "#888",
+};
+const errorStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: "#b00020",
+  marginTop: 4,
+};
 
 export default function TrafficMap() {
   // ---------- Harita merkezi ----------
@@ -84,25 +111,42 @@ export default function TrafficMap() {
 
   const [indexPct, setIndexPct] = useState<number | null>(null);
   const [indexTime, setIndexTime] = useState<string | null>(null);
+  const [indexLoading, setIndexLoading] = useState(true);
+  const [indexError, setIndexError] = useState<string | null>(null);
 
   const [routes, setRoutes] = useState<CommuteRoute[]>([]);
   const [selected, setSelected] = useState<CommuteRoute | null>(null);
+  const [commuteLoading, setCommuteLoading] = useState(false);
+  const [commuteError, setCommuteError] = useState<string | null>(null);
 
   const [events, setEvents] = useState<EventItem[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(true);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+
+  const [weather, setWeather] = useState<WeatherResp | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState(true);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
 
   // ---------- Trafik endeksi (5 dakikada bir) ----------
   useEffect(() => {
     let alive = true;
 
     const load = async () => {
+      setIndexLoading(true);
       try {
         const r = await fetch(`${API_BASE}/api/index`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j: IndexResp = await r.json();
         if (!alive) return;
         setIndexPct(j.index);
         setIndexTime(new Date(j.updatedAt).toLocaleTimeString());
-      } catch {
+        setIndexError(null);
+      } catch (e) {
+        if (!alive) return;
         setIndexPct(null);
+        setIndexError("Trafik verisi alınamadı");
+      } finally {
+        if (alive) setIndexLoading(false);
       }
     };
 
@@ -116,16 +160,63 @@ export default function TrafficMap() {
 
   // ---------- Etkinlikler ----------
   useEffect(() => {
-    (async () => {
+    let alive = true;
+
+    const load = async () => {
+      setEventsLoading(true);
       try {
         const r = await fetch(`${API_BASE}/api/events/upcoming`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
+        if (!alive) return;
         const items: EventItem[] = [...(j.active || []), ...(j.upcoming || [])];
         setEvents(items);
+        setEventsError(null);
       } catch {
+        if (!alive) return;
         setEvents([]);
+        setEventsError("Etkinlikler yüklenemedi");
+      } finally {
+        if (alive) setEventsLoading(false);
       }
-    })();
+    };
+
+    load();
+    const t = setInterval(load, 15 * 60 * 1000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  // ---------- Hava durumu (15 dakikada bir) ----------
+  useEffect(() => {
+    let alive = true;
+
+    const load = async () => {
+      setWeatherLoading(true);
+      try {
+        const r = await fetch(`${API_BASE}/api/weather`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j: WeatherResp = await r.json();
+        if (!alive) return;
+        setWeather(j);
+        setWeatherError(null);
+      } catch {
+        if (!alive) return;
+        setWeather(null);
+        setWeatherError("Hava durumu alınamadı");
+      } finally {
+        if (alive) setWeatherLoading(false);
+      }
+    };
+
+    load();
+    const t = setInterval(load, 15 * 60 * 1000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
 
   // ---------- Autocomplete bağlama ----------
@@ -152,6 +243,8 @@ export default function TrafficMap() {
   // ---------- Rota hesaplama (backend) ----------
   const calcRoute = async () => {
     if (!origin || !destination) return;
+    setCommuteLoading(true);
+    setCommuteError(null);
     const qs = new URLSearchParams({
       from: `${origin.lat},${origin.lng}`,
       to: `${destination.lat},${destination.lng}`,
@@ -175,6 +268,11 @@ export default function TrafficMap() {
       }
     } catch (e) {
       console.error(e);
+      setRoutes([]);
+      setSelected(null);
+      setCommuteError("Rota hesaplanamadı, lütfen tekrar deneyin");
+    } finally {
+      setCommuteLoading(false);
     }
   };
 
@@ -189,6 +287,18 @@ export default function TrafficMap() {
       return null;
     }
   }, [selected]);
+
+  // Sadece koordinatı olan etkinlikler haritada işaretlenebilir (örn. resmi
+  // tatiller şehir geneli olduğu için konumsuz gelir).
+  const mappableEvents = useMemo(
+    () => events.filter((ev): ev is EventItem & { lat: number; lng: number } => ev.lat != null && ev.lng != null),
+    [events]
+  );
+
+  const rainSoon = useMemo(() => {
+    if (!weather) return false;
+    return weather.next3h.probability.some((p) => p != null && p >= 50);
+  }, [weather]);
 
   // ---------- Render ----------
   return (
@@ -207,13 +317,32 @@ export default function TrafficMap() {
 
             <div style={panelHeading}>
               Güncel Trafik Yoğunluğu:{" "}
-              {indexPct == null ? "—" : `%${indexPct}`}
+              {indexLoading ? "Yükleniyor…" : indexPct == null ? "—" : `%${indexPct}`}
             </div>
-            {indexTime && (
-              <div style={{ fontSize: 12, color: "#888", marginBottom: 8 }}>
-                Son güncelleme: {indexTime}
-              </div>
+            {indexTime && !indexError && (
+              <div style={mutedStyle}>Son güncelleme: {indexTime}</div>
             )}
+            {indexError && <div style={errorStyle}>{indexError}</div>}
+
+            {/* Hava durumu */}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>Hava Durumu</div>
+              {weatherLoading && <div style={mutedStyle}>Yükleniyor…</div>}
+              {weatherError && <div style={errorStyle}>{weatherError}</div>}
+              {!weatherLoading && weather && (
+                <div style={{ fontSize: 13 }}>
+                  {weather.current.temperature != null ? `${Math.round(weather.current.temperature)}°C` : "—"}
+                  {typeof weather.current.windSpeed === "number" && (
+                    <> &nbsp;·&nbsp; Rüzgar {Math.round(weather.current.windSpeed)} km/s</>
+                  )}
+                  {rainSoon && (
+                    <div style={{ color: "#a15c00", marginTop: 4 }}>
+                      ⚠️ Önümüzdeki 3 saatte yağış bekleniyor — trafik yoğunlaşabilir
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
 
             <div style={labelStyle}>Başlangıç</div>
             <Autocomplete onLoad={onOriginLoad} onPlaceChanged={onOriginChanged}>
@@ -238,10 +367,11 @@ export default function TrafficMap() {
             <button
               style={{ marginTop: 10, width: "100%", padding: 10, fontWeight: 600 }}
               onClick={calcRoute}
-              disabled={!origin || !destination}
+              disabled={!origin || !destination || commuteLoading}
             >
-              Rota Hesapla
+              {commuteLoading ? "Hesaplanıyor…" : "Rota Hesapla"}
             </button>
+            {commuteError && <div style={errorStyle}>{commuteError}</div>}
 
             {/* Rota özetleri */}
             {routes.length > 0 && (
@@ -279,19 +409,22 @@ export default function TrafficMap() {
             )}
 
             {/* Etkinlikler */}
-            {events.length > 0 && (
-              <div style={{ marginTop: 16 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>Etkinlikler</div>
-                {events.map((ev, i) => (
-                  <div key={i} style={{ marginBottom: 8 }}>
-                    <b>{ev.title}</b> – {ev.venue}
-                    <div style={{ fontSize: 12, color: "#666" }}>
-                      {new Date(ev.startISO).toLocaleString()}
-                    </div>
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>Etkinlikler</div>
+              {eventsLoading && <div style={mutedStyle}>Yükleniyor…</div>}
+              {eventsError && <div style={errorStyle}>{eventsError}</div>}
+              {!eventsLoading && !eventsError && events.length === 0 && (
+                <div style={mutedStyle}>Yakın zamanda etkinlik yok</div>
+              )}
+              {events.map((ev, i) => (
+                <div key={i} style={{ marginBottom: 8 }}>
+                  <b>{ev.title}</b> – {ev.venue}
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    {new Date(ev.startISO).toLocaleString()}
                   </div>
-                ))}
-              </div>
-            )}
+                </div>
+              ))}
+            </div>
           </aside>
         )}
 
@@ -328,8 +461,8 @@ export default function TrafficMap() {
               />
             )}
 
-            {/* Etkinlik markerları */}
-            {events.map((ev, i) => (
+            {/* Etkinlik markerları (konumu olanlar) */}
+            {mappableEvents.map((ev, i) => (
               <Marker position={{ lat: ev.lat, lng: ev.lng }} key={i} />
             ))}
 
