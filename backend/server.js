@@ -10,7 +10,9 @@ app.use(cors());
 const PORT = process.env.PORT || 5050;
 const GMAPS_KEY = process.env.GOOGLE_MAPS_SERVER_KEY;
 
-/* Şehir Geneli Trafik İndeksi */
+/* ----------------------------
+   Şehir Geneli Trafik İndeksi (Directions üzerinden türetilir)
+   ---------------------------- */
 const ROUTES = [
   { name: "E5 Batı→Merkez (Beylikdüzü→Bakırköy)", from: { lat: 41.0018, lng: 28.6401 }, to: { lat: 40.9799, lng: 28.8721 } },
   { name: "E5 Doğu→Merkez (Kartal→Kadıköy)",       from: { lat: 40.9076, lng: 29.2278 }, to: { lat: 40.9871, lng: 29.0356 } },
@@ -84,7 +86,9 @@ app.get("/api/index", async (_req, res) => {
   }
 });
 
-/* Gidiş Asistanı */
+/* ----------------------------
+   Gidiş Asistanı
+   ---------------------------- */
 app.get("/api/commute", async (req, res) => {
   try {
     const { from, to, modes = "driving,transit,walking" } = req.query;
@@ -132,7 +136,9 @@ app.get("/api/commute", async (req, res) => {
   }
 });
 
-/* Etkinlik / Maç Pik Uyarısı (örnek) */
+/* ----------------------------
+   Etkinlik / Maç Pik Uyarısı (örnek)
+   ---------------------------- */
 const EVENTS = [
   { title: "Vodafone Park Maçı",   lat: 41.0391, lng: 29.0006, start: "2025-09-01T18:00:00+03:00", end: "2025-09-01T21:00:00+03:00", venue: "Vodafone Park" },
   { title: "Rams Park Maçı",       lat: 41.1032, lng: 28.9989, start: "2025-09-02T20:00:00+03:00", end: "2025-09-02T23:00:00+03:00", venue: "Rams Park" },
@@ -156,7 +162,9 @@ app.get("/api/events/upcoming", (_req, res) => {
   res.json({ active, upcoming, generatedAt: now.toISOString() });
 });
 
-/* Hava */
+/* ----------------------------
+   Hava
+   ---------------------------- */
 app.get("/api/weather", async (req, res) => {
   try {
     const lat = req.query.lat ? Number(req.query.lat) : 41.01; // İstanbul
