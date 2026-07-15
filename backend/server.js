@@ -169,10 +169,21 @@ const ICS_URLS = (process.env.EVENTS_ICS_URLS || "")
   .map((u) => u.trim())
   .filter(Boolean);
 
-const FALLBACK_EVENTS = [
-  { title: "Vodafone Park Maçı", lat: 41.0391, lng: 29.0006, start: "2025-09-01T18:00:00+03:00", end: "2025-09-01T21:00:00+03:00", venue: "Vodafone Park" },
-  { title: "Rams Park Maçı", lat: 41.1032, lng: 28.9989, start: "2025-09-02T20:00:00+03:00", end: "2025-09-02T23:00:00+03:00", venue: "Rams Park" },
-];
+// Dates are computed relative to "now" (rather than hardcoded) so the
+// fallback still shows something plausible whenever it's actually used,
+// instead of going stale the moment the hardcoded dates are in the past.
+function buildFallbackEvents() {
+  const at = (daysFromNow, hour) => {
+    const d = new Date();
+    d.setDate(d.getDate() + daysFromNow);
+    d.setHours(hour, 0, 0, 0);
+    return d.toISOString();
+  };
+  return [
+    { title: "Örnek: Vodafone Park Maçı", lat: 41.0391, lng: 29.0006, start: at(3, 18), end: at(3, 20), venue: "Vodafone Park" },
+    { title: "Örnek: Rams Park Maçı", lat: 41.1032, lng: 28.9989, start: at(4, 20), end: at(4, 22), venue: "Rams Park" },
+  ];
+}
 
 async function fetchIcsEvents(url) {
   try {
@@ -185,7 +196,7 @@ async function fetchIcsEvents(url) {
 }
 
 async function loadEvents() {
-  if (!ICS_URLS.length) return FALLBACK_EVENTS;
+  if (!ICS_URLS.length) return { events: buildFallbackEvents(), source: "fallback" };
 
   const now = new Date();
   const horizon = new Date(now.getTime() + 21 * 24 * 60 * 60 * 1000); // 3 hafta ileri bak
@@ -222,7 +233,9 @@ async function loadEvents() {
     // Diğerleri (İstanbul dışındaki deplasman maçları vb.) atlanır.
   }
 
-  return mapped.length ? mapped : FALLBACK_EVENTS;
+  if (mapped.length) return { events: mapped, source: "ics" };
+  console.warn("ICS feeds returned no usable events, using fallback sample");
+  return { events: buildFallbackEvents(), source: "fallback" };
 }
 
 let eventsCache = null;
@@ -235,12 +248,12 @@ app.get("/api/events/upcoming", async (_req, res) => {
       eventsCache = await loadEvents();
       eventsCacheAt = Date.now();
     }
-    const { active, upcoming } = splitEvents(eventsCache, new Date());
+    const { active, upcoming } = splitEvents(eventsCache.events, new Date());
     res.json({
       active,
       upcoming,
       generatedAt: new Date().toISOString(),
-      source: ICS_URLS.length ? "ics" : "fallback",
+      source: eventsCache.source,
     });
   } catch (e) {
     console.error("events error:", e.message);
