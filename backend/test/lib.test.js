@@ -14,13 +14,23 @@ const {
   computeExpectedMinutes,
 } = require("../lib");
 
-test("computeIndex averages increasePct and clamps to 1-99", () => {
+test("computeIndex falls back to plain mean of increasePct when durations are missing", () => {
   const { index, avgIncreasePct } = computeIndex([
     { name: "a", increasePct: 10 },
     { name: "b", increasePct: 20 },
   ]);
   assert.equal(avgIncreasePct, 15);
-  assert.equal(index, 16); // round(1 + 15)
+  assert.equal(index, 15);
+});
+
+test("computeIndex is duration-weighted when normalSec/inTrafficSec are present", () => {
+  // 45 dk'lık koridor %50 yavaşlamış, 5 dk'lık tünel akıcı: düz ortalama %25
+  // derdi; süre-ağırlıklı gerçek: (4050+300)/(2700+300)-1 = %45.
+  const { index } = computeIndex([
+    { name: "E5", increasePct: 50, normalSec: 2700, inTrafficSec: 4050 },
+    { name: "Tünel", increasePct: 0, normalSec: 300, inTrafficSec: 300 },
+  ]);
+  assert.equal(index, 45);
 });
 
 test("computeIndex ignores errored routes", () => {
@@ -28,12 +38,25 @@ test("computeIndex ignores errored routes", () => {
     { name: "a", increasePct: 10 },
     { name: "b", error: "timeout" },
   ]);
-  assert.equal(index, 11); // round(1 + 10)
+  assert.equal(index, 10);
 });
 
-test("computeIndex clamps extreme values into [1, 99]", () => {
-  assert.equal(computeIndex([{ name: "a", increasePct: 500 }]).index, 99);
-  assert.equal(computeIndex([{ name: "a", increasePct: -50 }]).index, 1);
+test("computeIndex clamps into [0, 100] and floors 'faster than typical' at 0", () => {
+  assert.equal(computeIndex([{ name: "a", increasePct: 500 }]).index, 100);
+  assert.equal(computeIndex([{ name: "a", increasePct: -50 }]).index, 0);
+  // Süre-ağırlıklı yolda da: trafik tipikten hızlıysa negatife düşmek yerine 0.
+  assert.equal(
+    computeIndex([{ name: "a", increasePct: -20, normalSec: 1000, inTrafficSec: 800 }]).index,
+    0
+  );
+});
+
+test("computeIndex returns a human-readable level", () => {
+  assert.equal(computeIndex([{ name: "a", increasePct: 5 }]).level, "Akıcı");
+  assert.equal(computeIndex([{ name: "a", increasePct: 15 }]).level, "Hafif");
+  assert.equal(computeIndex([{ name: "a", increasePct: 30 }]).level, "Orta");
+  assert.equal(computeIndex([{ name: "a", increasePct: 55 }]).level, "Yoğun");
+  assert.equal(computeIndex([{ name: "a", increasePct: 90 }]).level, "Çok yoğun");
 });
 
 test("computeIndex throws when no usable routes", () => {
@@ -200,10 +223,63 @@ test("computeWeatherFactor ignores 'raining right now' when targetDate is in the
 test("computeEventFactor reasons are date-stamped so they still make sense for a future trip", () => {
   const origin = { lat: 41.0391, lng: 29.0006 };
   const { reasons } = computeEventFactor(
-    [{ title: "Beşiktaş - Eyüpspor", venue: "Vodafone Park", lat: 41.0391, lng: 29.0006, start: "2026-08-16T15:00:00Z" }],
+    [{ title: "Beşiktaş - Eyüpspor", venue: "Vodafone Park", lat: 41.0391, lng: 29.0006, start: "2026-08-16T15:00:00Z", end: "2026-08-16T17:00:00Z" }],
     origin,
-    origin
+    origin,
+    new Date("2026-08-16T14:00:00Z") // maça 1 saat kala — giriş penceresi
   );
   assert.equal(reasons.length, 1);
   assert.match(reasons[0], /Ağu/); // Turkish short month abbreviation shows up in the date stamp
+});
+
+// ---------- Etkinlik zaman fazları: sadece giriş/çıkış pencerelerinde uyar ----------
+
+test("computeEventFactor stays silent hours before the event (no 5-hours-early warnings)", () => {
+  const origin = { lat: 41.0391, lng: 29.0006 }; // Vodafone Park'ın dibi
+  const ev = { title: "Konser", venue: "Vodafone Park", lat: 41.0391, lng: 29.0006, start: "2026-08-16T20:00:00Z", end: "2026-08-16T23:00:00Z" };
+
+  // 5 saat önce: sıfır etki, sıfır uyarı — mekanın dibinden geçiliyor olsa bile.
+  const early = computeEventFactor([ev], origin, origin, new Date("2026-08-16T15:00:00Z"));
+  assert.deepEqual(early, { multiplier: 1, reasons: [] });
+
+  // 1 saat önce: giriş kalabalığı — tam etki.
+  const arrival = computeEventFactor([ev], origin, origin, new Date("2026-08-16T19:00:00Z"));
+  assert.equal(arrival.multiplier, 1.25);
+  assert.match(arrival.reasons[0], /giriş saati/);
+
+  // Gösteri ortası: hafif etki.
+  const mid = computeEventFactor([ev], origin, origin, new Date("2026-08-16T21:30:00Z"));
+  assert.ok(mid.multiplier > 1 && mid.multiplier < 1.25);
+  assert.match(mid.reasons[0], /sürüyor/);
+
+  // Bitişten 20 dk sonra: çıkış kalabalığı — tam etki.
+  const exit = computeEventFactor([ev], origin, origin, new Date("2026-08-16T23:20:00Z"));
+  assert.equal(exit.multiplier, 1.25);
+  assert.match(exit.reasons[0], /çıkış saatine/);
+
+  // 2 saat sonra: bitti, etki yok.
+  const gone = computeEventFactor([ev], origin, origin, new Date("2026-08-17T01:00:00Z"));
+  assert.deepEqual(gone, { multiplier: 1, reasons: [] });
+});
+
+test("computeEventFactor detects venues on the route path, not just at the endpoints", () => {
+  // Uçlar mekandan uzak (~6+ km), ama rota Vodafone Park'ın dibinden geçiyor.
+  const origin = { lat: 41.10, lng: 29.00 };
+  const destination = { lat: 40.98, lng: 29.03 };
+  const routePath = [
+    { lat: 41.10, lng: 29.00 },
+    { lat: 41.06, lng: 29.005 },
+    { lat: 41.039, lng: 29.0006 }, // stadın dibi
+    { lat: 41.00, lng: 29.02 },
+    { lat: 40.98, lng: 29.03 },
+  ];
+  const ev = { title: "Maç", venue: "Vodafone Park", lat: 41.0391, lng: 29.0006, start: "2026-08-16T20:00:00Z", end: "2026-08-16T22:00:00Z" };
+  const at = new Date("2026-08-16T19:00:00Z"); // giriş penceresi
+
+  const withoutPath = computeEventFactor([ev], origin, destination, at);
+  assert.equal(withoutPath.multiplier, 1); // uçlara bakınca uzak görünüyor
+
+  const withPath = computeEventFactor([ev], origin, destination, at, routePath);
+  assert.equal(withPath.multiplier, 1.25); // rota geometrisi yakalıyor
+  assert.match(withPath.reasons[0], /rota üzerinde/);
 });

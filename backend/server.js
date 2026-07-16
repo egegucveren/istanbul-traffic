@@ -15,6 +15,7 @@ const {
   isHolidayEvent,
   splitEvents,
   computeExpectedMinutes,
+  decodePolyline,
   ISTANBUL_VENUES,
 } = require("./lib");
 const { fetchBiletixIstanbulEvents } = require("./biletix");
@@ -105,6 +106,64 @@ async function getLegTimes(from, to) {
   return { normal, inTraffic };
 }
 
+/* ----------------------------
+   Serbest akış (free-flow) tabanı
+   ÖNEMLİ: Google'ın `duration` alanı "trafiksiz" süre DEĞİL — o saatin
+   tipik/ortalama trafiğini zaten içeren statik tahmin. Canlıyı ona
+   kıyaslamak "bugün her zamankinden ne kadar farklı"yı ölçer; haritadaki
+   kırmızıların temsil ettiği MUTLAK sıkışıklığı değil. (Canlı doğrulandı:
+   akşam 20:20'de E5'te duration=33 dk, duration_in_traffic=30 dk → eski
+   formül %0 diyordu, yol kıpkırmızıyken.)
+   Doğru taban: aynı rotanın GECE 03:30 (boş yol) tahmini. TomTom congestion
+   index'i de aynen böyle hesaplanır. Rota başına günde 1 ek Directions
+   çağrısı (24 saat cache).
+   ---------------------------- */
+const freeflowCache = new Map(); // key -> { sec, at }
+const FREEFLOW_TTL = 24 * 60 * 60 * 1000;
+const FREEFLOW_CACHE_MAX = 500;
+
+// Bir sonraki 03:30 Europe/Istanbul (TR'de DST yok, sabit UTC+3 → 00:30 UTC).
+function nextNightEpochSec() {
+  const now = Date.now();
+  const d = new Date(now);
+  let night = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 30, 0);
+  if (night <= now) night += 24 * 60 * 60 * 1000;
+  return Math.floor(night / 1000);
+}
+
+async function getFreeflowSec(from, to) {
+  const key = `${from.lat.toFixed(3)},${from.lng.toFixed(3)}|${to.lat.toFixed(3)},${to.lng.toFixed(3)}`;
+  const cached = freeflowCache.get(key);
+  if (cached && Date.now() - cached.at < FREEFLOW_TTL) return cached.sec;
+
+  const origin = `${from.lat},${from.lng}`;
+  const destination = `${to.lat},${to.lng}`;
+  const { leg } = await directionsCall({ origin, destination, mode: "driving", depart: String(nextNightEpochSec()) });
+  const sec = leg.duration_in_traffic?.value || leg.duration?.value;
+  if (!sec) throw new Error("freeflow duration missing");
+
+  if (freeflowCache.size >= FREEFLOW_CACHE_MAX) {
+    freeflowCache.delete(freeflowCache.keys().next().value);
+  }
+  freeflowCache.set(key, { sec, at: Date.now() });
+  return sec;
+}
+
+/** Canlı süre + serbest akış tabanı → gerçek sıkışıklık ölçümü. */
+async function measureCongestion(from, to) {
+  const t = await getLegTimes(from, to);
+  // Freeflow çağrısı başarısız olursa tipik süreye düş (eski davranış) —
+  // ölçüm hiç dönmemekten iyidir.
+  const freeflow = await getFreeflowSec(from, to).catch(() => t.normal);
+  // Güvenlik: gece tahmini bir tuhaflıkla tipikten uzun çıkarsa tipiği taban al.
+  const base = Math.min(freeflow, t.normal);
+  return {
+    increasePct: (t.inTraffic / base - 1) * 100,
+    normalSec: base,
+    inTrafficSec: t.inTraffic,
+  };
+}
+
 let indexCache = null;
 let indexCacheAt = 0;
 const INDEX_TTL = 30 * 1000;
@@ -116,18 +175,21 @@ app.get("/api/index", async (_req, res) => {
     const results = await Promise.all(
       ROUTES.map(async (r) => {
         try {
-          const t = await getLegTimes(r.from, r.to);
-          const ratio = t.inTraffic / t.normal;
-          return { name: r.name, increasePct: (ratio - 1) * 100 };
+          // measureCongestion: canlı süre / GECE boş yol süresi — mutlak
+          // sıkışıklık. from/to koordinatları frontend'in "görünen bölgeye
+          // göre yoğunluk" hesabı için; normalSec/inTrafficSec süre-ağırlıklı
+          // yüzde hesabı için (uzun koridor kısa tünelden çok ağırlık alır).
+          const m = await measureCongestion(r.from, r.to);
+          return { name: r.name, ...m, from: r.from, to: r.to };
         } catch (e) {
-          return { name: r.name, error: e.message };
+          return { name: r.name, error: e.message, from: r.from, to: r.to };
         }
       })
     );
 
-    let index, avgIncreasePct;
+    let index, avgIncreasePct, level;
     try {
-      ({ index, avgIncreasePct } = computeIndex(results));
+      ({ index, avgIncreasePct, level } = computeIndex(results));
     } catch (computeErr) {
       // Every single route failed — this is almost always a Google API
       // config problem (bad/restricted key, Directions API not enabled,
@@ -138,12 +200,121 @@ app.get("/api/index", async (_req, res) => {
       return res.status(500).json({ error: computeErr.message, routes: results });
     }
 
-    indexCache = { index, avgIncreasePct, routes: results, updatedAt: new Date().toISOString() };
+    indexCache = { index, avgIncreasePct, level, routes: results, updatedAt: new Date().toISOString() };
     indexCacheAt = Date.now();
     res.json(indexCache);
   } catch (err) {
     console.error("Index error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ----------------------------
+   Görünen bölge için canlı yoğunluk ölçümü
+   Sabit 8 koridor şehir genelini temsil eder ama kullanıcı bir mahalleye
+   zoomladığında oradaki gerçek durumu göstermez (haritadaki kırmızılar
+   Google TrafficLayer'dan gelir, bizim koridorlardan değil). Bu endpoint,
+   verilen bbox'ın içinden geçen iki çapraz örnek rotayı Google Directions
+   ile CANLI ölçüp aynı süre-ağırlıklı formülle yerel bir yüzde üretir.
+   Maliyet kontrolü: bbox ~1km hassasiyetle yuvarlanıp 60 sn cache'lenir,
+   frontend da istekleri debounce eder.
+   ---------------------------- */
+const localIndexCache = new Map(); // key -> { data, at }
+const LOCAL_INDEX_TTL = 60 * 1000;
+const LOCAL_INDEX_CACHE_MAX = 300;
+
+// Frontend'deki harita kısıtıyla aynı kutu — örnek rotalar İstanbul dışına
+// (ör. Marmara'nın karşı kıyısına, İzmit'e) taşmasın.
+const ISTANBUL_BBOX = { n: 41.62, s: 40.75, w: 27.95, e: 29.95 };
+
+// Bir koridor doğru parçası verilen bbox ile kesişiyor mu (parça örnekleme —
+// 8 koridor için fazlasıyla ucuz ve yeterince hassas).
+function segmentIntersectsBbox(from, to, b) {
+  const inside = (p) => p.lat <= b.n && p.lat >= b.s && p.lng >= b.w && p.lng <= b.e;
+  if (inside(from) || inside(to)) return true;
+  const STEPS = 16;
+  for (let i = 1; i < STEPS; i++) {
+    const t = i / STEPS;
+    if (inside({ lat: from.lat + (to.lat - from.lat) * t, lng: from.lng + (to.lng - from.lng) * t })) return true;
+  }
+  return false;
+}
+
+app.get("/api/index/local", async (req, res) => {
+  try {
+    const n = Number(req.query.n), s = Number(req.query.s), e = Number(req.query.e), w = Number(req.query.w);
+    if (![n, s, e, w].every(Number.isFinite) || n <= s || e <= w) {
+      return res.status(400).json({ error: "n,s,e,w (görünüm bbox'ı) gerekli" });
+    }
+    // İstanbul kutusuna kırp — görünüm kısmen il dışına taşarsa örnek rota
+    // uçları deniz/il dışına düşmesin.
+    const cn = Math.min(n, ISTANBUL_BBOX.n), cs = Math.max(s, ISTANBUL_BBOX.s);
+    const ce = Math.min(e, ISTANBUL_BBOX.e), cw = Math.max(w, ISTANBUL_BBOX.w);
+    if (cn <= cs || ce <= cw) return res.status(400).json({ error: "bbox İstanbul dışında" });
+
+    const latSpan = cn - cs, lngSpan = ce - cw;
+    // Çok büyük görünüm = şehir geneli endeksi zaten yeterli; çok küçük =
+    // anlamlı rota çıkmaz (birkaç sokak).
+    if (latSpan > 0.45 || lngSpan > 0.9) {
+      return res.status(400).json({ error: "bbox çok büyük — şehir geneli endeksi kullanın" });
+    }
+    if (latSpan < 0.004 || lngSpan < 0.004) {
+      return res.status(400).json({ error: "bbox çok küçük" });
+    }
+
+    // ~1km hassasiyet: yakın pan'lar aynı cache girdisine düşer.
+    const key = [cn, cs, ce, cw].map((v) => v.toFixed(2)).join(",");
+    const cached = localIndexCache.get(key);
+    if (cached && Date.now() - cached.at < LOCAL_INDEX_TTL) return res.json(cached.data);
+
+    // Kenarlardan %18 içeriden üç örnek (iki çapraz + orta yatay): görünümün
+    // farklı akslarını yoklar, tek bir caddenin durumuna aşırı bağlı kalmaz.
+    const mx = 0.18 * lngSpan, my = 0.18 * latSpan;
+    const midLat = (cn + cs) / 2;
+    const samples = [
+      { from: { lat: cn - my, lng: cw + mx }, to: { lat: cs + my, lng: ce - mx } }, // KB→GD
+      { from: { lat: cs + my, lng: cw + mx }, to: { lat: cn - my, lng: ce - mx } }, // GB→KD
+      { from: { lat: midLat, lng: cw + mx }, to: { lat: midLat, lng: ce - mx } },   // B→D orta hat
+    ];
+    const results = await Promise.all(
+      samples.map(async (r, i) => {
+        try {
+          // Aynı mutlak ölçüm: canlı vs gece boş yol (freeflow 24 saat
+          // cache'li — aynı bölgeye ikinci bakıştan itibaren ek maliyeti yok).
+          const m = await measureCongestion(r.from, r.to);
+          return { name: `bölge-örneği-${i + 1}`, ...m };
+        } catch (err) {
+          return { name: `bölge-örneği-${i + 1}`, error: err.message };
+        }
+      })
+    );
+
+    // Görünümden geçen sabit koridorların TAZE verisi de karışıma katılır:
+    // canlı örneklerle birlikte süre-ağırlıklı tek havuzda hesaplanır. Bu,
+    // ölçümü yalnızca 3 örnek rotaya bağımlı olmaktan çıkarır.
+    const corridorExtras =
+      indexCache && Date.now() - indexCacheAt < 5 * 60 * 1000
+        ? (indexCache.routes || []).filter(
+            (r) => !r.error && r.from && r.to && segmentIntersectsBbox(r.from, r.to, { n: cn, s: cs, e: ce, w: cw })
+          )
+        : [];
+
+    const { index, avgIncreasePct, level } = computeIndex([...results, ...corridorExtras]); // hepsi hatalıysa throw
+    const data = {
+      index,
+      avgIncreasePct,
+      level,
+      samples: results.filter((r) => !r.error).length + corridorExtras.length,
+      updatedAt: new Date().toISOString(),
+    };
+    if (localIndexCache.size >= LOCAL_INDEX_CACHE_MAX) {
+      localIndexCache.delete(localIndexCache.keys().next().value); // en eskiyi at
+    }
+    localIndexCache.set(key, { data, at: Date.now() });
+    res.json(data);
+  } catch (e) {
+    console.error("local index error:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -252,7 +423,10 @@ app.get("/api/commute", commuteLimiter, async (req, res) => {
     const { active: activeEvents } = splitEvents(eventsList.events, travelAt);
 
     const enriched = results.map(r => {
-      const expected = computeExpectedMinutes(r.nowMin, r.mode, weather, activeEvents, originLL, destLL, travelAt);
+      // Rota geometrisi de yakınlık kontrolüne girer: etkinlik mekanı
+      // başlangıca/varışa uzak olsa bile rota dibinden geçiyorsa uyarılır.
+      const routePath = r.polyline ? decodePolyline(r.polyline) : null;
+      const expected = computeExpectedMinutes(r.nowMin, r.mode, weather, activeEvents, originLL, destLL, travelAt, routePath);
       return {
         ...r,
         diffToFastestMin: fastest && r.nowMin != null ? r.nowMin - fastest.nowMin : null,

@@ -16,6 +16,26 @@ import {
 // though the key itself was valid and correctly configured.
 const GOOGLE_MAPS_LIBRARIES: ("places" | "geometry")[] = ["places", "geometry"];
 
+// İstanbul il sınırlarını kapsayan kaba dikdörtgen (Silivri'den Şile'ye,
+// Karadeniz kıyısından Adalar'ın güneyine). Harita bu kutunun dışına
+// kaydırılamaz; minZoom da şehir görünümünden daha fazla uzaklaşmayı önler —
+// proje İstanbul trafiğine odaklı, dünya haritasına dönüşmesin.
+const ISTANBUL_BOUNDS = {
+  north: 41.62,
+  south: 40.75,
+  west: 27.95,
+  east: 29.95,
+};
+
+// Başlangıç/Varış autocomplete'leri de aynı kutuya kilitli: strictBounds
+// sayesinde İstanbul dışından öneri gelmez (ülke kısıtı da TR).
+const AUTOCOMPLETE_OPTIONS: google.maps.places.AutocompleteOptions = {
+  bounds: ISTANBUL_BOUNDS,
+  strictBounds: true,
+  componentRestrictions: { country: "tr" },
+  fields: ["geometry.location", "formatted_address", "name"],
+};
+
 type LatLng = google.maps.LatLngLiteral;
 
 type CommuteRoute = {
@@ -42,11 +62,62 @@ type CommuteResp = {
   generatedAt: string;
 };
 
+type IndexRoute = {
+  name: string;
+  increasePct?: number;
+  normalSec?: number;
+  inTrafficSec?: number;
+  error?: string;
+  from?: LatLng;
+  to?: LatLng;
+};
+
 type IndexResp = {
   index: number;
   avgIncreasePct: number;
+  level?: string;
+  routes?: IndexRoute[];
   updatedAt: string;
 };
+
+// Backend'deki computeIndex ile birebir aynı formül: trafikteki TOPLAM ekstra
+// sürenin trafiksiz toplam süreye oranı (süre-ağırlıklı, [0,100]). Uzun
+// koridorlar kısa geçişlerden daha çok ağırlık alır.
+function indexFromRoutes(routes: IndexRoute[]): number | null {
+  const usable = routes.filter(
+    (r) => typeof r.normalSec === "number" && r.normalSec > 0 && typeof r.inTrafficSec === "number"
+  );
+  if (!usable.length) return null;
+  const totalNormal = usable.reduce((s, r) => s + r.normalSec!, 0);
+  const totalInTraffic = usable.reduce((s, r) => s + Math.max(r.inTrafficSec!, r.normalSec!), 0);
+  const increase = (totalInTraffic / totalNormal - 1) * 100;
+  return Math.min(100, Math.max(0, Math.round(increase)));
+}
+
+// Backend'deki trafficLevel ile aynı eşikler.
+function trafficLevelLabel(index: number): string {
+  if (index < 10) return "Akıcı";
+  if (index < 25) return "Hafif";
+  if (index < 45) return "Orta";
+  if (index < 70) return "Yoğun";
+  return "Çok yoğun";
+}
+
+// Bir rota doğru parçasının (from→to) verilen harita görünümüyle kesişip
+// kesişmediği. Uç noktalardan biri içerideyse yeter; ikisi de dışarıdaysa
+// parçayı örnekleyerek kontrol ederiz (küçük N için yeterince hassas ve ucuz).
+function segmentIntersectsBounds(from: LatLng, to: LatLng, b: google.maps.LatLngBounds): boolean {
+  const contains = (p: LatLng) => b.contains(new google.maps.LatLng(p.lat, p.lng));
+  if (contains(from) || contains(to)) return true;
+  const STEPS = 16;
+  for (let i = 1; i < STEPS; i++) {
+    const t = i / STEPS;
+    if (contains({ lat: from.lat + (to.lat - from.lat) * t, lng: from.lng + (to.lng - from.lng) * t })) {
+      return true;
+    }
+  }
+  return false;
+}
 
 type EventItem = {
   title: string;
@@ -127,6 +198,15 @@ export default function TrafficMap() {
   const [indexTime, setIndexTime] = useState<string | null>(null);
   const [indexLoading, setIndexLoading] = useState(true);
   const [indexError, setIndexError] = useState<string | null>(null);
+  // Şehir geneli rotalar (koordinatlı) — görünen bölgeye göre yerel endeks
+  // hesabı için saklanır. localIndexPct null ise şehir geneli gösterilir.
+  const indexRoutesRef = useRef<IndexRoute[]>([]);
+  const [localIndexPct, setLocalIndexPct] = useState<number | null>(null);
+  const [localRouteCount, setLocalRouteCount] = useState(0);
+  // "live": bbox içinden canlı Google ölçümü; "corridor": sabit koridorlardan.
+  const [localMode, setLocalMode] = useState<"live" | "corridor" | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
+  const localReqIdRef = useRef(0); // eski (geciken) isteklerin sonucunu ele
 
   const [routes, setRoutes] = useState<CommuteRoute[]>([]);
   const [selected, setSelected] = useState<CommuteRoute | null>(null);
@@ -145,6 +225,74 @@ export default function TrafficMap() {
   const [weatherLoading, setWeatherLoading] = useState(true);
   const [weatherError, setWeatherError] = useState<string | null>(null);
 
+  // ---------- Görünen bölgeye göre yerel trafik endeksi ----------
+  // İki katmanlı yaklaşım:
+  //  * Zoom >= 12 (mahalle/ilçe seviyesi): görünümün İÇİNDEN geçen iki çapraz
+  //    örnek rota backend üzerinden Google'a CANLI ölçtürülür — haritada
+  //    görülen kırmızılarla aynı kaynaktan beslenir. (Backend 60 sn cache'ler,
+  //    burada da debounce var; maliyet kontrollü.)
+  //  * Daha uzak zoom'larda: görünümle kesişen sabit ölçüm koridorlarının
+  //    süre-ağırlıklı ortalaması (ek API maliyeti yok).
+  const corridorFallback = (bounds: google.maps.LatLngBounds) => {
+    const routes = indexRoutesRef.current;
+    const usable = routes.filter((r) => typeof r.increasePct === "number" && r.from && r.to);
+    const visible = usable.filter((r) => segmentIntersectsBounds(r.from!, r.to!, bounds));
+    if (!visible.length || visible.length === usable.length) {
+      // Görünümde ölçüm rotası yoksa yerel değer üretilemez; hepsi
+      // görünüyorsa zaten şehir geneli ile aynıdır.
+      setLocalIndexPct(null);
+      setLocalMode(null);
+      setLocalRouteCount(visible.length);
+      return;
+    }
+    setLocalIndexPct(indexFromRoutes(visible));
+    setLocalMode("corridor");
+    setLocalRouteCount(visible.length);
+  };
+
+  const recomputeLocalIndex = async () => {
+    const map = mapRef.current;
+    const bounds = map?.getBounds();
+    if (!map || !bounds) {
+      setLocalIndexPct(null);
+      setLocalMode(null);
+      setLocalRouteCount(0);
+      return;
+    }
+    const zoom = map.getZoom() ?? 11;
+    if (zoom < 12) {
+      corridorFallback(bounds);
+      return;
+    }
+    const ne = bounds.getNorthEast();
+    const sw = bounds.getSouthWest();
+    const reqId = ++localReqIdRef.current;
+    try {
+      const qs = new URLSearchParams({
+        n: ne.lat().toFixed(4),
+        s: sw.lat().toFixed(4),
+        e: ne.lng().toFixed(4),
+        w: sw.lng().toFixed(4),
+      });
+      const r = await fetch(`${API_BASE}/api/index/local?${qs.toString()}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      if (reqId !== localReqIdRef.current) return; // bu arada harita oynadı, sonuç bayat
+      setLocalIndexPct(typeof j.index === "number" ? j.index : null);
+      setLocalMode("live");
+      setLocalRouteCount(j.samples ?? 0);
+    } catch {
+      if (reqId === localReqIdRef.current) corridorFallback(bounds);
+    }
+  };
+
+  // idle her pan/zoom karesinde tetiklenir; canlı ölçüm isteğini kullanıcı
+  // gerçekten durduğunda atmak için 700 ms debounce.
+  const onMapIdle = () => {
+    if (idleTimerRef.current != null) window.clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = window.setTimeout(recomputeLocalIndex, 700);
+  };
+
   // ---------- Trafik endeksi (5 dakikada bir) ----------
   useEffect(() => {
     let alive = true;
@@ -159,6 +307,8 @@ export default function TrafficMap() {
         setIndexPct(j.index);
         setIndexTime(new Date(j.updatedAt).toLocaleTimeString());
         setIndexError(null);
+        indexRoutesRef.current = j.routes || [];
+        recomputeLocalIndex(); // yeni veriyle mevcut görünüm için yerel endeksi tazele
       } catch (e) {
         if (!alive) return;
         setIndexPct(null);
@@ -241,10 +391,25 @@ export default function TrafficMap() {
   const onOriginLoad = (ac: google.maps.places.Autocomplete) => (originAutoRef.current = ac);
   const onDestLoad = (ac: google.maps.places.Autocomplete) => (destAutoRef.current = ac);
 
+  const [placeError, setPlaceError] = useState<string | null>(null);
+
+  // strictBounds önerileri İstanbul'a kısıtlar ama yine de (ör. koordinat
+  // yapıştırma, Google'ın kutu kenarındaki esnek eşleşmeleri) son bir
+  // doğrulama yapıyoruz: seçilen nokta il sınır kutusunun dışındaysa reddet.
+  const inIstanbul = (lat: number, lng: number) =>
+    lat >= ISTANBUL_BOUNDS.south && lat <= ISTANBUL_BOUNDS.north &&
+    lng >= ISTANBUL_BOUNDS.west && lng <= ISTANBUL_BOUNDS.east;
+
   const onOriginChanged = () => {
     const p = originAutoRef.current?.getPlace();
     const loc = p?.geometry?.location;
     if (loc) {
+      if (!inIstanbul(loc.lat(), loc.lng())) {
+        setPlaceError("Başlangıç noktası İstanbul sınırları içinde olmalı");
+        setOrigin(null);
+        return;
+      }
+      setPlaceError(null);
       setOrigin({ lat: loc.lat(), lng: loc.lng() });
       setOriginText(p?.formatted_address || p?.name || originText);
     }
@@ -253,6 +418,12 @@ export default function TrafficMap() {
     const p = destAutoRef.current?.getPlace();
     const loc = p?.geometry?.location;
     if (loc) {
+      if (!inIstanbul(loc.lat(), loc.lng())) {
+        setPlaceError("Varış noktası İstanbul sınırları içinde olmalı");
+        setDestination(null);
+        return;
+      }
+      setPlaceError(null);
       setDestination({ lat: loc.lat(), lng: loc.lng() });
       setDestText(p?.formatted_address || p?.name || destText);
     }
@@ -317,11 +488,41 @@ export default function TrafficMap() {
     }
   }, [selected]);
 
+  // ---------- Etkinlikleri seçilen seyahat zamanına göre filtrele ----------
+  // "Ne zaman?" boşsa yolculuk "şu an" demektir: sadece şu an aktif olan
+  // veya bugün (gece yarısına kadar) başlayacak etkinlikler gösterilir —
+  // haftalarca ilerideki etkinlikler o senaryoda gürültüdür. İleri tarihli
+  // bir zaman seçilirse o GÜNÜN etkinlikleri gösterilir, böylece "cumartesi
+  // 18:00'de yola çıksam" diyen kullanıcı o günkü maçı/konseri görür.
+  const visibleEvents = useMemo(() => {
+    const parsed = whenText ? new Date(whenText) : null;
+    const ref = parsed && !Number.isNaN(parsed.getTime()) && parsed > new Date()
+      ? parsed
+      : new Date();
+    const dayStart = new Date(ref); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(ref); dayEnd.setHours(23, 59, 59, 999);
+    return events.filter((ev) => {
+      const start = new Date(ev.startISO);
+      const end = new Date(ev.endISO);
+      // O gün ile kesişen her etkinlik: gün içinde başlayan, ya da daha önce
+      // başlayıp o gün hâlâ süren (ör. çok günlük resmi tatil).
+      return start <= dayEnd && end >= dayStart;
+    });
+  }, [events, whenText]);
+
+  const eventsHeading = useMemo(() => {
+    const parsed = whenText ? new Date(whenText) : null;
+    if (parsed && !Number.isNaN(parsed.getTime()) && parsed > new Date()) {
+      return `Etkinlikler — ${parsed.toLocaleDateString("tr-TR", { day: "2-digit", month: "long" })}`;
+    }
+    return "Bugünkü Etkinlikler";
+  }, [whenText]);
+
   // Sadece koordinatı olan etkinlikler haritada işaretlenebilir (örn. resmi
   // tatiller şehir geneli olduğu için konumsuz gelir).
   const mappableEvents = useMemo(
-    () => events.filter((ev): ev is EventItem & { lat: number; lng: number } => ev.lat != null && ev.lng != null),
-    [events]
+    () => visibleEvents.filter((ev): ev is EventItem & { lat: number; lng: number } => ev.lat != null && ev.lng != null),
+    [visibleEvents]
   );
 
   const rainSoon = useMemo(() => {
@@ -358,10 +559,21 @@ export default function TrafficMap() {
 
             <div style={panelHeading}>
               Güncel Trafik Yoğunluğu:{" "}
-              {indexLoading ? "Yükleniyor…" : indexPct == null ? "—" : `%${indexPct}`}
+              {indexLoading
+                ? "Yükleniyor…"
+                : (localIndexPct ?? indexPct) == null
+                ? "—"
+                : `%${localIndexPct ?? indexPct} · ${trafficLevelLabel((localIndexPct ?? indexPct)!)}`}
             </div>
             {indexTime && !indexError && (
-              <div style={mutedStyle}>Son güncelleme: {indexTime}</div>
+              <div style={mutedStyle}>
+                {localIndexPct != null && localMode === "live"
+                  ? `Görünen bölge (canlı ölçüm) · Şehir geneli: %${indexPct ?? "—"}`
+                  : localIndexPct != null
+                  ? `Görünen bölge (${localRouteCount} koridor) · Şehir geneli: %${indexPct ?? "—"}`
+                  : "Şehir geneli"}
+                {" · "}Son güncelleme: {indexTime}
+              </div>
             )}
             {indexError && <div style={errorStyle}>{indexError}</div>}
 
@@ -386,7 +598,7 @@ export default function TrafficMap() {
             </div>
 
             <div style={labelStyle}>Başlangıç</div>
-            <Autocomplete onLoad={onOriginLoad} onPlaceChanged={onOriginChanged}>
+            <Autocomplete onLoad={onOriginLoad} onPlaceChanged={onOriginChanged} options={AUTOCOMPLETE_OPTIONS}>
               <input
                 value={originText}
                 onChange={(e) => setOriginText(e.target.value)}
@@ -396,7 +608,7 @@ export default function TrafficMap() {
             </Autocomplete>
 
             <div style={labelStyle}>Varış</div>
-            <Autocomplete onLoad={onDestLoad} onPlaceChanged={onDestChanged}>
+            <Autocomplete onLoad={onDestLoad} onPlaceChanged={onDestChanged} options={AUTOCOMPLETE_OPTIONS}>
               <input
                 value={destText}
                 onChange={(e) => setDestText(e.target.value)}
@@ -404,6 +616,8 @@ export default function TrafficMap() {
                 style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
               />
             </Autocomplete>
+
+            {placeError && <div style={errorStyle}>{placeError}</div>}
 
             <div style={labelStyle}>Ne zaman? (opsiyonel — boşsa şu an)</div>
             <input
@@ -478,13 +692,13 @@ export default function TrafficMap() {
 
             {/* Etkinlikler */}
             <div style={{ marginTop: 16 }}>
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>Etkinlikler</div>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>{eventsHeading}</div>
               {eventsLoading && <div style={mutedStyle}>Yükleniyor…</div>}
               {eventsError && <div style={errorStyle}>{eventsError}</div>}
-              {!eventsLoading && !eventsError && events.length === 0 && (
-                <div style={mutedStyle}>Yakın zamanda etkinlik yok</div>
+              {!eventsLoading && !eventsError && visibleEvents.length === 0 && (
+                <div style={mutedStyle}>Bu tarihte etkinlik yok</div>
               )}
-              {events.map((ev, i) => (
+              {visibleEvents.map((ev, i) => (
                 <div key={i} style={{ marginBottom: 8 }}>
                   <b>{ev.title}</b> – {ev.venue}
                   <div style={{ fontSize: 12, color: "#666" }}>
@@ -509,23 +723,51 @@ export default function TrafficMap() {
 
           <GoogleMap
             onLoad={(m) => { mapRef.current = m; }} // ✅ void döner
+            onIdle={onMapIdle}
             mapContainerStyle={containerStyle}
             center={center}
             zoom={11}
-            options={{ gestureHandling: "greedy", mapTypeControl: false }}
+            options={{
+              gestureHandling: "greedy",
+              mapTypeControl: false,
+              // Haritayı İstanbul il sınırlarına kilitle: pan bu kutunun
+              // dışına çıkamaz, zoom şehir seviyesinin altına inemez.
+              restriction: { latLngBounds: ISTANBUL_BOUNDS, strictBounds: false },
+              minZoom: 9,
+            }}
           >
             {/* Trafik katmanı */}
             <TrafficLayer />
 
-            {/* Seçilen rota */}
-            {decodedPath && (
+            {/* Seçilen rota — SADECE seçili modun çizgisi gösterilir.
+                key={mode}: mod değişince Polyline tamamen yeniden kurulur,
+                eski modun (ör. araba) çizgisi haritada asla kalmaz. */}
+            {decodedPath && selected && (
               <Polyline
+                key={selected.mode}
                 path={decodedPath}
-                options={{
-                  strokeColor: "#1976d2",
-                  strokeOpacity: 0.9,
-                  strokeWeight: 6,
-                }}
+                options={
+                  selected.mode === "walking"
+                    ? {
+                        // Yürüyüş: yeşil kesikli — araba rotasıyla karışmaz.
+                        strokeColor: "#2e7d32",
+                        strokeOpacity: 0,
+                        strokeWeight: 5,
+                        icons: [
+                          {
+                            icon: { path: "M 0,-1 0,1", strokeOpacity: 1, strokeColor: "#2e7d32", strokeWeight: 4, scale: 3 },
+                            offset: "0",
+                            repeat: "18px",
+                          },
+                        ],
+                      }
+                    : {
+                        strokeColor: selected.mode === "transit" ? "#6a1b9a" : "#1976d2",
+                        strokeOpacity: 0.9,
+                        strokeWeight: 6,
+                        icons: [],
+                      }
+                }
               />
             )}
 
