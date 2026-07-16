@@ -2,222 +2,158 @@
 
 [![CI](https://github.com/egegucveren/istanbul-traffic/actions/workflows/ci.yml/badge.svg)](https://github.com/egegucveren/istanbul-traffic/actions/workflows/ci.yml)
 
-A live traffic dashboard for Istanbul. It combines real-time driving data, a commute planner, event awareness (football fixtures, public holidays, concerts, theater, stand-up), and weather into a single **expected travel time** — not just what Google says right now, but what it's likely to become once rain or a nearby event kicks in, for right now *or* a trip you're planning days ahead.
+Live traffic dashboard for Istanbul. Combines Google traffic data with the weather forecast and the city's event calendar (football, concerts, theater, public holidays) to estimate what a trip will actually take, right now or up to a week ahead.
 
-## Quick start (TL;DR)
+## Quick start
 
-You need two terminals — one for the backend, one for the frontend — plus a Google Maps API key.
+Two terminals, plus a Google Maps API key:
 
 ```bash
 # Terminal 1 — backend
 cd backend
 npm install
-cp .env.example .env        # paste your Google Maps server key into it (skip if .env already exists)
+cp .env.example .env        # add your server-side Google Maps key (skip if .env exists)
 npm start                   # → http://localhost:5050
 
 # Terminal 2 — frontend
 cd frontend
 npm install
-cp .env.example .env        # paste your Google Maps browser key into it (skip if .env already exists)
-npm start                   # → http://localhost:3000, opens automatically
+cp .env.example .env        # add your browser-side Google Maps key (skip if .env exists)
+npm start                   # → http://localhost:3000
 ```
 
-Leave both running and open `http://localhost:3000`. See [Getting started](#getting-started) below for API key setup, and [Troubleshooting](#troubleshooting) if `/api/index` or `/api/commute` error out.
+See [Setup](#setup) for API key details and [Troubleshooting](#troubleshooting) if something errors out.
 
-## What it does
+## Features
 
-- **Expected travel time** — for any commute (right now, or up to 7 days ahead), the backend layers the weather forecast and any nearby Istanbul events on top of Google's traffic-predicted duration, producing an `expectedMin` figure with plain-language reasons ("Yağış ihtimali var", "16 Ağu 15:00 — Beşiktaş - Eyüpspor (Vodafone Park) çok yakın — yoğun trafik bekleniyor"). See [How "expected time" is calculated](#how-expected-time-is-calculated).
-- **Plan a future trip** — pick a date/time (up to 7 days out) in the commute planner instead of "now". Google Directions returns a traffic *prediction* for that time, the weather check looks at the forecast for that specific hour instead of right now, and events are matched against whatever's happening on that day, not today.
-- **City-wide traffic index** — polls Google Directions on 8 major corridors (E5, TEM, both Bosphorus bridges, Eurasia Tunnel, airport route) and derives a single congestion percentage, refreshed every 5 minutes.
-- **Commute assistant** — pick an origin and destination (with Places autocomplete) and compare driving, transit, and walking times against typical conditions and the weather/event-adjusted expected time, with the fastest option highlighted on the map.
-- **Event awareness, three automatic sources merged together:**
-  1. Football fixtures + Turkish public holidays from live `.ics` feeds (only home games at Istanbul stadiums are kept; away games are filtered out).
-  2. Concerts, theater, stand-up, and other sports, scraped automatically from Biletix's server-rendered category pages — see the [Biletix integration](#biletix-integration-concertstheaterstand-up) section for exactly how this works and its limits.
-  3. An optional hand-maintained `events.manual.json` for anything the automatic sources miss.
-- **Weather context** — pulls a 7-day hourly forecast and shows current conditions + a 3-hour outlook, with an on-panel warning when rain is likely.
-- **Live map** — Google Maps with the traffic layer enabled, plus the selected route and event venues drawn on top.
-- Loading/error states throughout the panel instead of silent failures, input validation and rate limiting on the backend, a `/api/health` check, and CI running the full test suite on every push.
+- **Traffic index** measured against the empty road, not the daily average. Each of the 8 reference corridors (E5 both directions, TEM both directions, both bridges, the Eurasia Tunnel, airport road) is compared to its own 3:30 AM travel time. 0% means free flow, 100% means trips take at least twice as long. This matters: Google's `duration` field already bakes in typical traffic for the hour, so comparing live time against it tells you "is today unusual?" rather than "is there traffic?" — evening rush would read as ~0%. Comparing against the night baseline gives the number you intuitively expect, and it's how TomTom computes its city congestion rankings.
+- **Zoom-aware percentage.** Zoom into a district and the panel re-measures that area live: three sample routes inside the visible map area, blended with whichever reference corridors pass through it. Requests are debounced and results cached server-side (the night baseline for 24h, measurements for 60s), so panning around doesn't burn through API quota.
+- **Commute planner** with driving/transit/walking comparison, Places autocomplete locked to Istanbul, and an optional departure time up to 7 days out. Future trips use Google's traffic prediction for that hour, the weather forecast for that hour, and whatever events fall on that day.
+- **Expected travel time.** On top of Google's raw estimate, the backend applies a weather factor and an events factor and returns `expectedMin` with human-readable reasons ("Yağış ihtimali var", "Konser (Zorlu PSM) rota üzerinde — çıkış saatine denk geliyor").
+- **Event-aware, with realistic timing.** An event only affects the estimate during the windows where it actually affects traffic: the arrival crush (2h before start until 30min after) and the exit crush (30min before the end until 45min after), both at full weight; a small effect while the show is running; nothing outside those windows. A concert 5 hours away doesn't generate warnings. Venue proximity is checked against the actual route geometry, so a route that passes right by a stadium gets flagged even if both endpoints are far from it.
+- **Map locked to Istanbul.** Panning/zooming is restricted to the province bounds, and each travel mode draws its own route style (walking is a green dashed line, transit purple, driving blue) so you always know what you're looking at.
 
-## How "expected time" is calculated
+## Event sources
 
-`GET /api/commute` still returns Google's raw `nowMin` (traffic-predicted duration for the requested time) and `typicalMin` (no-traffic baseline) unchanged. Alongside them it now returns:
+Three sources are merged, all optional, all with graceful fallbacks:
 
-- `expectedMin` — `nowMin` adjusted by a weather factor and an events factor (see `backend/lib.js`):
-  - **Weather** (`computeWeatherFactor`): looks at the max rain probability/volume forecast within ±2h of the requested travel time (fetched for the midpoint of your route from a 7-day hourly Open-Meteo forecast) and, if the trip is right now, whether it's raining at this exact moment. Calm → ×1.0. ≥40% chance or light rain → ×1.12. ≥70% chance or heavy rain → ×1.25. Raining right now (only applies to "now" trips) → an extra ×1.08.
-  - **Events** (`computeEventFactor`): checks every Istanbul event active around the requested travel time (home match, public holiday, concert, theater, stand-up — from all three sources above) against the straight-line distance to your origin/destination. Within 1.5 km of a venue → ×1.25. Within 3 km → ×1.12. A city-wide public holiday → ×0.95 (Istanbul traffic is typically lighter on holidays).
-  - The two factors combine and scale per travel mode — driving feels the full effect, transit half of it, walking only reacts to weather (crowds don't slow down a sidewalk) — then clamp to a sane ×0.85–×1.6 range.
-- `adjustmentReasons` — the human-readable, date-stamped reasons behind that adjustment, shown directly under each route option in the UI.
-- `travelAt` / `isFutureTrip` — the actual time the estimate was computed for, and whether it's a future trip (vs. "now").
-- Top-level `weatherConsidered` (bool) and `eventsConsidered` (count) so you can tell whether the adjustment actually had data to work with.
-
-All of this logic lives in pure, unit-tested functions in `backend/lib.js` (`haversineKm`, `computeWeatherFactor`, `computeEventFactor`, `computeExpectedMinutes`) — see `backend/test/lib.test.js`.
-
-## Biletix integration (concerts/theater/stand-up)
-
-Biletix has no public API. Its homepage is JS-rendered, but its **category listing pages** (`biletix.com/category/{MUSIC,ART,SPORT,FAMILY}/TURKIYE/tr`) do render a "Hot Tickets" list of upcoming events server-side, with real title/venue/date data in the initial HTML — no JavaScript execution needed to read it. `backend/biletix.js` fetches those pages and extracts events at venues it recognizes from `ISTANBUL_VENUES` (see below).
-
-**Caveats, read before relying on this:**
-- This was built and verified by fetching Biletix's pages directly, but **could not be tested end-to-end from inside this backend** — the sandbox this was built in blocks outbound requests to `biletix.com` entirely (unrelated to Biletix itself; unfamiliar/non-allowlisted domains get blocked at the sandbox's network layer). It should work the same from a normal machine, but verify it after pulling this repo: `curl http://localhost:5050/api/events/upcoming` and check `"source"` includes `"biletix"`.
-- It's HTML scraping, not an API — if Biletix changes their page markup, this silently returns fewer/no events rather than crashing (same fallback behavior as the other event sources). No exact showtime is given on the listing cards, so scraped events default to a 20:00–23:00 window — treat their timing as approximate, unlike the ICS-sourced match times which are exact.
-- Only events at venues listed in `ISTANBUL_VENUES` (`backend/lib.js`) are kept, since the traffic-impact calculation needs real coordinates. Extend that list (see below) to widen coverage.
-
-## Known Istanbul venues (`ISTANBUL_VENUES` in `backend/lib.js`)
-
-| Venue | Key | What's there |
-|---|---|---|
-| Vodafone Park | `vodafone-park` | Beşiktaş football |
-| Rams Park | `rams-park` | Galatasaray football |
-| Şükrü Saracoğlu Stadyumu | `sukru-saracoglu` | Fenerbahçe football |
-| Ülker Sports Arena | `ulker-sports-arena` | Basketball, concerts |
-| Sinan Erdem Spor Salonu | `sinan-erdem` | Basketball, concerts, big events |
-| Zorlu PSM | `zorlu-psm` | Concerts, musicals, theater |
-| KüçükÇiftlik Park | `kucukciftlik-park` | Open-air concerts |
-| Cemal Reşit Rey Konser Salonu (CRR) | `crr` | Classical concerts, ballet |
-| Harbiye Cemil Topuzlu Açıkhava Tiyatrosu | `harbiye-acikhava` | Open-air concerts/theater |
-| Atatürk Kültür Merkezi (AKM) | `akm` | Opera, theater, concerts |
-| TÜYAP Fuar ve Kongre Merkezi | `tuyap` | Fairs/expos |
-
-Coordinates were checked against Wikipedia/official sources at the time this was written. To add a venue: add an entry to `ISTANBUL_VENUES` with a `key`, a `match` regex (matches either a LOCATION field or, for football, the team name), `name`, `lat`, `lng`.
-
-## Optional manual events (`backend/events.manual.json`)
-
-If the automatic sources miss something you know about, copy `backend/events.manual.example.json` to `backend/events.manual.json` (gitignored — not committed, edit freely) and add entries:
+1. **Football + public holidays** from `.ics` feeds (`EVENTS_ICS_URLS` in `backend/.env`). Only home games at Istanbul stadiums are kept; away fixtures are dropped by matching the home team name against known venues.
+2. **Biletix** for concerts, theater, stand-up and other ticketed events. There's no official API, but the search box on biletix.com is backed by a plain JSON endpoint that returns structured event data (name, venue, real start/end times, status) — `backend/biletix.js` queries it for Istanbul events in the next 3 weeks. If that endpoint ever changes or disappears, the code falls back to scraping the server-rendered category pages, and if that also fails it just returns fewer events instead of crashing. Multi-day listings (a play's whole run, an artist's tour entry) are skipped on purpose: only single shows have a predictable crowd window, and counting a two-month run as one continuous "active" event would poison the traffic estimate for weeks. Cancelled events and events outside İstanbul proper are filtered out.
+3. **Manual list** (`backend/events.manual.json`, gitignored) for anything the automatic sources miss. Copy `events.manual.example.json` and edit:
 
 ```json
 [{ "title": "...", "venueKey": "zorlu-psm", "start": "2026-09-12T20:30:00+03:00", "end": "2026-09-12T23:00:00+03:00" }]
 ```
 
-`venueKey` must match one of the keys above; alternatively skip it and provide `lat`/`lng`/`venue` directly for a venue not in the list.
+Only events at venues with known coordinates count toward the traffic estimate, since the whole point is judging how close the crowd is to your route. The list (`ISTANBUL_VENUES` in `backend/lib.js`) currently covers 24 venues: the three big stadiums plus Başakşehir and the Olympic stadium, the arenas (Ülker, Sinan Erdem, Volkswagen, Ora), the main concert/theater venues (Zorlu PSM, Harbiye Açıkhava, KüçükÇiftlik Park, AKM, CRR, İş Sanat, Trump Sahne, TİM, Bostancı Gösteri Merkezi), open-air/festival grounds (Parkorman, Festival Park Yenikapı, Maltepe, UNIQ), and TÜYAP + Lütfi Kırdar for fairs and congresses. Adding one is a single line: `key`, a `match` regex, `name`, `lat`, `lng`. Some coordinates are approximate venue centers, which is fine for the distance thresholds involved (1.5 / 3 km).
+
+## How "expected time" is calculated
+
+`GET /api/commute` returns Google's raw `nowMin` and `typicalMin` unchanged, plus:
+
+- `expectedMin` — `nowMin` adjusted by two factors (both in `backend/lib.js`, both unit tested):
+  - **Weather** (`computeWeatherFactor`): max rain probability/volume within ±2h of the travel time, from a 7-day hourly Open-Meteo forecast fetched for the route midpoint. Calm ×1.0, ≥40% chance or light rain ×1.12, ≥70% or heavy rain ×1.25, plus ×1.08 if it's raining right now (only for "now" trips).
+  - **Events** (`computeEventFactor`): every event active around the travel time, checked against origin, destination *and* the decoded route polyline. Within 1.5 km ×1.25, within 3 km ×1.12 — then scaled by the timing phase described above (arrival/exit windows full, mid-show 0.3×, otherwise zero). City-wide holidays apply a flat ×0.95 since Istanbul traffic is usually lighter.
+  - Factors combine per mode — driving takes the full effect, transit half, walking only reacts to weather — and clamp to ×0.85–1.6.
+- `adjustmentReasons` — date-stamped, phase-specific explanations shown under each route option.
+- `travelAt` / `isFutureTrip`, plus `weatherConsidered` and `eventsConsidered` so you can tell whether the adjustment had data behind it.
 
 ## Tech stack
 
-| Layer    | Stack |
-|----------|-------|
-| Frontend | React 19 + TypeScript (Create React App), `@react-google-maps/api` |
-| Backend  | Node.js + Express 5, `node-ical`, `express-rate-limit` |
-| External APIs / sources | Google Maps (Directions, Places, Traffic Layer), Open-Meteo (weather), `.ics` fixture/holiday feeds, Biletix (scraped) |
-| CI | GitHub Actions — backend unit tests + frontend typecheck/test/build on every push and PR |
+| Layer | Stack |
+|---|---|
+| Frontend | React 19 + TypeScript (CRA), `@react-google-maps/api` |
+| Backend | Node.js + Express 5, `node-ical`, `express-rate-limit` |
+| Data | Google Maps (Directions, Places, Traffic Layer), Open-Meteo, `.ics` fixture/holiday feeds, Biletix |
+| CI | GitHub Actions — backend tests + frontend typecheck/test/build on every push |
 
 ## Project structure
 
 ```
 istanbul-traffic/
-├── .github/workflows/ci.yml        # CI: backend tests + frontend typecheck/test/build
+├── .github/workflows/ci.yml
 ├── backend/
-│   ├── server.js                    # Express API: index, commute (+expected time), events, weather, health
-│   ├── lib.js                       # Pure helpers — traffic index, venue matching, event bucketing,
-│   │                                 #   weather/event ETA adjustment — all unit tested
-│   ├── biletix.js                   # Biletix category-page scraper (see caveats above)
-│   ├── events.manual.example.json   # Template for optional hand-added events
-│   ├── events.manual.json           # Your real manual events (gitignored, optional)
-│   ├── test/                        # node:test suites for lib.js and biletix.js
-│   ├── .env.example                  # Template — copy to .env and fill in real values
-│   └── .env                          # Server-side secrets (gitignored, not committed)
+│   ├── server.js                    # Express API: index, index/local, commute, events, weather, health
+│   ├── lib.js                       # Pure helpers: congestion math, venue matching, event phases,
+│   │                                #   weather/event ETA adjustment, polyline decoding — unit tested
+│   ├── biletix.js                   # Biletix event source (JSON endpoint + scraper fallback)
+│   ├── events.manual.example.json
+│   ├── test/                        # node:test suites
+│   └── .env.example                 # copy to .env (gitignored)
 └── frontend/
-    ├── src/
-    │   ├── App.tsx
-    │   ├── App.test.tsx              # Smoke tests for the side panel
-    │   └── TrafficMap.tsx            # Main map + side panel UI (incl. date/time picker)
-    ├── .env.example                   # Template — copy to .env and fill in real values
-    └── .env                           # Client-side keys (gitignored, not committed)
+    ├── src/TrafficMap.tsx           # map + side panel (index, weather, planner, events)
+    └── .env.example                 # copy to .env (gitignored)
 ```
 
-## Getting started
+## Setup
 
 ### Prerequisites
 
 - Node.js 18+
-- A Google Maps API key with the **Directions API**, **Places API**, and **Maps JavaScript API** enabled ([console.cloud.google.com](https://console.cloud.google.com/) → APIs & Services → Enable APIs)
+- A Google Maps key with **Directions API**, **Places API** and **Maps JavaScript API** enabled, and billing set up
 
-### 1. Backend
+Use separate keys for backend and frontend and restrict them in the Cloud Console (server key by IP/API, browser key by HTTP referrer — include `http://localhost:3000/*` for development). Only the `.env.example` templates are committed.
 
-```bash
-cd backend
-npm install
-cp .env.example .env   # then fill in your real key (skip if .env already exists)
-npm start
-```
-
-The API will be available at `http://localhost:5050`. You should see `✅ Backend http://localhost:5050 üzerinde çalışıyor` in the terminal.
-
-`backend/.env`:
+### Backend (`backend/.env`)
 
 ```
 GOOGLE_MAPS_SERVER_KEY=your_server_side_key
 PORT=5050
 TIMEZONE=Europe/Istanbul
 
-# Optional — team fixtures + TR holiday .ics feeds. If left empty,
-# /api/events/upcoming still gets events from Biletix (see above); if that's
-# also empty it falls back to a small sample.
+# Optional — fixtures + TR holidays. Empty is fine; Biletix still provides events.
 EVENTS_ICS_URLS=https://ics.fixtur.es/v2/galatasaray.ics,https://ics.fixtur.es/v2/fenerbahce.ics,https://ics.fixtur.es/v2/besiktas.ics,https://calendar.google.com/calendar/ical/tr.turkish%23holiday%40group.v.calendar.google.com/public/basic.ics
 
-# Optional — lock CORS down to your deployed frontend in production.
+# Optional — lock CORS to your deployed frontend in production.
 # ALLOWED_ORIGIN=https://your-app.netlify.app
 ```
 
-> `EVENTS_ICS_URLS` uses `ics.fixtur.es/v2/{team}.ics` — an earlier version of this project used `ics.fixtur.es/en/team/{team}.ics`, which now 404s. The backend auto-corrects the old-style URL if it's still in your `.env`, so this isn't a breaking change either way.
+Note: `ics.fixtur.es` moved from `/en/team/{team}.ics` to `/v2/{team}.ics` at some point; the backend auto-corrects old-style URLs, so stale `.env` files keep working.
 
-### 2. Frontend
-
-In a second terminal:
-
-```bash
-cd frontend
-npm install
-cp .env.example .env   # then fill in your real key (skip if .env already exists)
-npm start
-```
-
-The app opens automatically at `http://localhost:3000`.
-
-`frontend/.env`:
+### Frontend (`frontend/.env`)
 
 ```
 REACT_APP_GOOGLE_MAPS_KEY=your_browser_side_key
 REACT_APP_BACKEND=http://localhost:5050
 ```
 
-Both servers need to be running at the same time — the frontend calls the backend at `REACT_APP_BACKEND` for every panel section (traffic index, weather, events, commute).
+Both servers need to run at the same time.
 
-> Use separate Google Maps keys for backend and frontend, and restrict each one (server key by IP/API, browser key by HTTP referrer) in the Google Cloud Console. Never commit real `.env` files — only the `.env.example` templates are tracked.
+## API reference
 
-## Troubleshooting
-
-**`/api/index` returns "No routes computed" / logs show `Index error: all routes failed`.** Every one of the 8 reference routes failed to get a Directions response — almost always a Google Maps API configuration problem, not a network blip. The response body and server log now include each route's actual error message (e.g. `REQUEST_DENIED`, `This API project is not authorized to use this API`, billing not enabled). Check: Directions API is enabled on your Google Cloud project, billing is set up, and `GOOGLE_MAPS_SERVER_KEY` isn't restricted to the wrong IP/referrer.
-
-**`ICS fetch failed: ... 404 Not Found`.** You're on the old `ics.fixtur.es/en/team/...` URL style — see the note above; the backend now auto-corrects it, but double check `backend/.env` if it persists.
-
-**Events panel only shows the sample "Örnek: ..." entries.** This means all three real sources (ICS, Biletix, manual) came up empty — check the backend log for `ICS fetch failed`, `Biletix fetch error`, or `events.manual.json okunamadı` to see which one(s) failed and why.
+| Endpoint | Description |
+|---|---|
+| `GET /api/health` | Liveness check. |
+| `GET /api/index` | City-wide congestion (0–100%, vs. night free-flow baseline) across 8 corridors, duration-weighted so a 45-minute corridor counts more than a 5-minute tunnel. Includes per-route data and a level label (Akıcı/Hafif/Orta/Yoğun/Çok yoğun). Cached 30s. |
+| `GET /api/index/local?n=&s=&e=&w=` | Same measurement for an arbitrary bounding box (what the frontend calls when zoomed in). Three live sample routes inside the box, blended with fresh corridor data passing through it. Box is clamped to Istanbul; results cached ~60s at ~1km granularity. |
+| `GET /api/commute?from=lat,lng&to=lat,lng&modes=&when=` | Mode comparison with expected-time adjustment. `when` optional (ISO, up to 7 days ahead). Validated and rate limited (20/min/IP). |
+| `GET /api/events/upcoming` | Merged events from ICS + Biletix + manual, cached 15 min. `source` tells you which sources actually returned data, `"fallback"` if none did. |
+| `GET /api/weather?lat=&lng=` | Current conditions + 7-day hourly forecast. Cached per ~5km cell for 10 min. |
 
 ## Testing
 
 ```bash
-# Backend — unit tests for the pure calculation/filtering/ETA/scraping logic
-cd backend && npm test
+cd backend && npm test          # unit tests (congestion math, event phases, venue matching, Biletix mapping)
 
-# Frontend — component smoke tests + TypeScript check + production build
 cd frontend
 npx tsc --noEmit
 npm test -- --watchAll=false
 npm run build
 ```
 
-The same three frontend commands and `npm test` in the backend run automatically on every push/PR via `.github/workflows/ci.yml`.
+CI runs the same on every push and PR.
 
-## API reference (backend)
+## Troubleshooting
 
-| Endpoint | Description |
-|----------|--------------|
-| `GET /api/health` | Liveness check — `{ status: "ok", uptime }`. Useful for deployment platforms. |
-| `GET /api/index` | City-wide traffic index (1–99%), averaged across 8 reference routes. Cached for 30s. Rate limited. On total failure, returns each route's actual Google error for diagnosis. |
-| `GET /api/commute?from=lat,lng&to=lat,lng&modes=driving,transit,walking&when=ISO` | Travel time comparison across modes: `nowMin`/`typicalMin` (raw Google data) plus `expectedMin`/`adjustmentReasons` (weather + event adjusted). `when` is optional (ISO datetime, up to 7 days ahead) — omit it for "now". Validates `from`/`to`/`modes`/`when`. Rate limited to 20 req/min/IP. |
-| `GET /api/events/upcoming` | Active and upcoming events (matches, holidays, concerts, theater, stand-up) merged from ICS + Biletix + manual sources, cached for 15 min. `source` field shows which combination actually returned data (e.g. `"ics+biletix"`), or `"fallback"` if all three failed. |
-| `GET /api/weather?lat=&lng=` | Current conditions + a 7-day hourly forecast (`hourly`) and a next-3-hour slice (`next3h`) for the simple UI widget. Defaults to central Istanbul. Cached per ~5km area for 10 min. |
+**`/api/index` says "No routes computed" / log shows `Index error: all routes failed`.** Every corridor failed to get a Directions response, which is almost always a Google Cloud config problem: Directions API not enabled, billing missing, or the server key restricted to the wrong IP/API. The response includes each route's actual Google error message to diagnose.
+
+**Map shows "Sorry! Something went wrong" / console warns `InvalidKey`.** That's the *browser* key (`frontend/.env`), a separate thing from the server key. Check that Maps JavaScript API is enabled, billing is on, and the key's referrer restrictions include your dev URL. Restart the dev server after editing `.env` — CRA reads it only at startup.
+
+**Events panel only shows sample "Örnek: ..." entries.** All three sources came up empty; check the backend log for `ICS fetch failed`, `Biletix Solr fetch failed` or `events.manual.json okunamadı` to see which and why.
 
 ## Notes
 
-- The 8 reference routes for the traffic index are hardcoded in `backend/server.js` (`ROUTES`) and can be adjusted to cover different corridors.
-- The weather/event ETA multipliers in `computeWeatherFactor`/`computeEventFactor`/`computeExpectedMinutes` are a hand-tuned heuristic, not a fitted model — treat `expectedMin` as a directional estimate, and feel free to retune the thresholds in `backend/lib.js` (they're the parts under test).
-- Frontend deploys via Netlify (`frontend/netlify.toml`); the publish directory is `build`, matching Create React App's actual output folder.
-- The repo is public on GitHub — no API keys or `.env` files have ever been committed (only `.env.example` templates are tracked, plus `events.manual.json` is gitignored), but double-check before pushing anything new that touches credentials.
+- The 8 reference corridors are hardcoded in `backend/server.js` (`ROUTES`); adjust to taste.
+- The weather/event multipliers and the event timing windows are hand-tuned heuristics, not a fitted model. Treat `expectedMin` as directional. The thresholds all live in `backend/lib.js` and are covered by tests, so retuning them is safe.
+- The Biletix endpoint is unofficial. If events dry up, run `curl http://localhost:5050/api/events/upcoming` and check the `source` field first.
+- Frontend deploys to Netlify (`frontend/netlify.toml`), publish directory `build`.
